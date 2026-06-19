@@ -1,15 +1,16 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from functools import lru_cache
 import os
 
 
 class Settings(BaseSettings):
-    # LLM (Groq - generation only)
+    # API Keys
     groq_api_key: str = "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"
     groq_model: str = "llama-3.3-70b-versatile"
 
     # Database
-    database_url: str = "postgresql://postgres:password@localhost:5432/multimodal_rag"
+    database_url: str = Field(default="sqlite:///./multimodal_rag.db")
 
     # Model cache dirs
     hf_home: str = "models/huggingface"

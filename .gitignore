@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+multimodal_rag.db
+*.log
+models/
+.pytest_cache/

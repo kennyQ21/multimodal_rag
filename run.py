@@ -1,7 +1,10 @@
 """
 Multimodal RAG System — Entry Point
-Run with: python run.py
-or:        uvicorn app.api.main:app --reload
+
+Usage:
+    python run.py
+or:
+    uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
 """
 import uvicorn
 

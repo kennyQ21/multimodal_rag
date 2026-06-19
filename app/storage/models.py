@@ -1,7 +1,6 @@
 import datetime
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Text, Float
 from sqlalchemy.orm import relationship
-from pgvector.sqlalchemy import Vector
 from .database import Base
 
 
@@ -49,8 +48,6 @@ class Chunk(Base):
     # steps: [{"step": 1, "instruction": "...", "images": ["image_id_1", ...]}]
     steps = Column(JSON, nullable=False)
     retrieval_text = Column(Text, nullable=True)
-    # 1024-dim for bge-large-en-v1.5
-    embedding = Column(Vector(1024), nullable=True)
     document = relationship("Document", back_populates="chunks")
 
 

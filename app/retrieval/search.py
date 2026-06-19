@@ -58,36 +58,15 @@ def _bm25_search(query: str, top_k: int) -> list[tuple[str, float]]:
     return [(str(_bm25_chunk_ids[i]), float(scores[i])) for i in top_idx if scores[i] > 0]
 
 
-# ── pgvector Search ────────────────────────────────────────────────────────────
+# ── ChromaDB Search ────────────────────────────────────────────────────────────
 
 def _vector_search(query_embedding: list[float], top_k: int) -> list[tuple[str, float]]:
-    from app.storage.database import SessionLocal
-    from app.storage.models import Chunk
-    from sqlalchemy import text
-
-    db = SessionLocal()
     try:
-        # Use pgvector operator for cosine distance — smaller = more similar
-        vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-        rows = db.execute(
-            text(
-                """
-                SELECT id, 1 - (embedding <=> :vec::vector) AS similarity
-                FROM chunks
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> :vec::vector
-                LIMIT :k
-                """
-            ),
-            {"vec": vec_str, "k": top_k},
-        ).fetchall()
-        return [(str(r[0]), float(r[1])) for r in rows]
+        from app.storage.chroma import search_chroma
+        return search_chroma(query_embedding, top_k)
     except Exception as e:
-        logger.error(f"pgvector search error: {e}")
+        logger.error(f"ChromaDB search error: {e}")
         return []
-    finally:
-        db.close()
-
 
 # ── Reciprocal Rank Fusion ─────────────────────────────────────────────────────
 
@@ -106,22 +85,21 @@ def reciprocal_rank_fusion(
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def hybrid_search(query: str, queries: list[str] | None = None) -> list[tuple[str, float]]:
-    """
-    Run hybrid BM25 + vector search for one or more query strings.
-    Returns merged (chunk_id, rrf_score) list, top-60.
-    """
-    from app.config import get_settings
-    from app.retrieval.embeddings import embed_texts
+def hybrid_search(query: str, queries: list[str] = None, top_k: int = 30) -> list[tuple[str, float]]:
+    """BM25-only search (simplified for stability)."""
+    search_queries = [query]
+    if queries:
+        search_queries.extend(queries)
 
-    settings = get_settings()
-    all_queries = queries or [query]
+    # BM25 Search
+    bm25_results = []
+    for q in set(search_queries):
+        bm25_results.extend(_bm25_search(q, top_k=top_k))
 
-    bm25_lists, vector_lists = [], []
-    for q in all_queries:
-        bm25_lists.append(_bm25_search(q, settings.bm25_top_k))
-        emb = embed_texts([q])[0]
-        vector_lists.append(_vector_search(emb, settings.vector_top_k))
+    # Aggregate scores for duplicate chunk_ids
+    aggregated = {}
+    for chunk_id, score in bm25_results:
+        aggregated[chunk_id] = max(aggregated.get(chunk_id, 0.0), score)
 
-    merged = reciprocal_rank_fusion(bm25_lists + vector_lists, k=settings.rrf_k, top_k=60)
-    return merged
+    sorted_results = sorted(aggregated.items(), key=lambda x: x[1], reverse=True)
+    return sorted_results[:top_k]

@@ -6,6 +6,7 @@ Rules:
 - Never instantiate per request.
 - OCR only cropped regions, not full pages.
 - Cache OCR results in the DB via image hash.
+- Gracefully falls back to pytesseract if PaddleOCR not installed.
 """
 import logging
 from typing import Optional
@@ -13,20 +14,35 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ── Singleton instances ────────────────────────────────────────────────────────
 _paddle_ocr_instance = None
+_paddle_available: Optional[bool] = None
 _tesseract_available: Optional[bool] = None
 
 
-def get_ocr() -> "PaddleOCR":  # noqa: F821
-    """Return the cached PaddleOCR singleton. Downloads weights once."""
+def _check_paddle() -> bool:
+    global _paddle_available
+    if _paddle_available is None:
+        try:
+            import paddleocr  # noqa: F401
+            import paddlepaddle  # noqa: F401
+            _paddle_available = True
+        except ImportError:
+            _paddle_available = False
+            logger.warning("PaddleOCR not installed — will use pytesseract fallback.")
+    return _paddle_available
+
+
+def get_ocr():
+    """Return the cached PaddleOCR singleton (downloads weights on first call)."""
     global _paddle_ocr_instance
+    if not _check_paddle():
+        return None
     if _paddle_ocr_instance is None:
         logger.info("Initialising PaddleOCR (first call — may download weights)…")
-        from paddleocr import PaddleOCR  # imported lazily to avoid slow startup
+        from paddleocr import PaddleOCR
         _paddle_ocr_instance = PaddleOCR(
             use_gpu=False,
-            use_angle_cls=False,   # skip angle classifier to save memory
+            use_angle_cls=False,
             show_log=False,
             lang="en",
         )
@@ -43,31 +59,28 @@ def _is_tesseract_available() -> bool:
             _tesseract_available = True
         except Exception:
             _tesseract_available = False
-            logger.warning("pytesseract not available — fallback OCR disabled.")
+            logger.warning("pytesseract not available — OCR will return empty strings.")
     return _tesseract_available
 
-
-# ── Public API ─────────────────────────────────────────────────────────────────
 
 def run_ocr(image: np.ndarray) -> str:
     """
     Run OCR on a cropped image region.
-
-    Flow:
-        PaddleOCR
-          └─ success → return text
-          └─ failure → pytesseract fallback
-                        └─ failure → return ""
+    Flow: PaddleOCR → pytesseract fallback → "" if both fail.
     """
     # ── Primary: PaddleOCR ────────────────────────────────────────────────────
-    try:
-        ocr = get_ocr()
-        result = ocr.ocr(image, cls=False)
-        if result and result[0]:
-            lines = [line[1][0] for line in result[0] if line and line[1]]
-            return " ".join(lines).strip()
-    except Exception as e:
-        logger.warning(f"PaddleOCR failed: {e} — trying pytesseract fallback.")
+    if _check_paddle():
+        try:
+            ocr = get_ocr()
+            if ocr:
+                result = ocr.ocr(image, cls=False)
+                if result and result[0]:
+                    lines = [line[1][0] for line in result[0] if line and line[1]]
+                    text = " ".join(lines).strip()
+                    if text:
+                        return text
+        except Exception as e:
+            logger.warning(f"PaddleOCR failed: {e} — trying pytesseract.")
 
     # ── Fallback: pytesseract ─────────────────────────────────────────────────
     if _is_tesseract_available():
@@ -75,9 +88,9 @@ def run_ocr(image: np.ndarray) -> str:
             import pytesseract
             from PIL import Image as PILImage
             pil_img = PILImage.fromarray(image)
-            text = pytesseract.image_to_string(pil_img).strip()
+            text = pytesseract.image_to_string(pil_img, config="--psm 6").strip()
             return text
         except Exception as e:
-            logger.warning(f"pytesseract fallback also failed: {e}")
+            logger.warning(f"pytesseract also failed: {e}")
 
     return ""

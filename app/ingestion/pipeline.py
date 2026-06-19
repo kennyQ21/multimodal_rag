@@ -1,10 +1,12 @@
 """
 PDF Ingestion Pipeline
 
+Uses PyMuPDF for text block + image extraction.
+No external layout model required — uses PyMuPDF's native block detection
+which is reliable for structured technical PDFs.
+
 Flow per page:
-    PyMuPDF → render page image → LayoutParser → crop regions
-    → OCR each crop (PaddleOCR + fallback) → OCR cache check
-    → semantic chunking → embed → store in PostgreSQL
+  PyMuPDF → text blocks + images → OCR image crops → semantic chunks → embed → store
 """
 import os
 import uuid
@@ -24,23 +26,6 @@ from app.storage.models import Document, Page, Image, Chunk, OCRCache
 
 logger = logging.getLogger(__name__)
 
-# ── LayoutParser model singleton ───────────────────────────────────────────────
-_lp_model = None
-
-def get_layout_model():
-    global _lp_model
-    if _lp_model is None:
-        logger.info("Loading LayoutParser model…")
-        import layoutparser as lp
-        _lp_model = lp.PaddleDetectionLayoutModel(
-            config_path="lp://PubLayNet/ppyolov2_r50vd_dcn_365e_publaynet/config",
-            threshold=0.45,
-            label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-            enforce_cpu=True,
-        )
-        logger.info("LayoutParser ready.")
-    return _lp_model
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -58,53 +43,47 @@ def _cache_ocr(img_hash: str, text: str, db):
     db.commit()
 
 
-def _figure_label(figure_counter: int) -> str:
-    return f"Fig {figure_counter}"
-
-
 # ── Chunk flush ────────────────────────────────────────────────────────────────
 
-def _flush_chunk(doc_id: str, proc_id: str, proc_title: str,
-                 page_start: int, page_end: int,
-                 steps: list[dict], db):
-    """Embed steps retrieval text and persist a Chunk row."""
+def _flush_chunk(doc_id, proc_id, proc_title, page_start, page_end, steps, db):
     if not steps:
+        return
+    # Filter out empty steps
+    valid_steps = [s for s in steps if s.get("instruction") or s.get("images")]
+    if not valid_steps:
         return
 
     from app.retrieval.embeddings import embed_texts
     settings = get_settings()
 
-    # Build retrieval text: instruction + OCR captions for images
     parts = []
-    for s in steps:
+    for s in valid_steps:
         if s.get("instruction"):
             parts.append(s["instruction"])
         for img_id in s.get("images", []):
-            img_row = db.query(Image).filter(Image.id == img_id).first()
-            if img_row and img_row.caption:
-                parts.append(img_row.caption)
+            cached = _get_cached_ocr(img_id, db)
+            if cached:
+                parts.append(cached)
 
     retrieval_text = " ".join(parts).strip()
     if not retrieval_text:
-        return
+        retrieval_text = proc_title or "procedure"
 
-    vectors = embed_texts([retrieval_text], batch_size=settings.embedding_batch_size)
-    embedding = vectors[0]
-
+    chunk_id = str(uuid.uuid4())
     chunk = Chunk(
-        id=str(uuid.uuid4()),
+        id=chunk_id,
         document_id=doc_id,
         procedure_id=proc_id,
         procedure_title=proc_title,
         page_start=page_start,
         page_end=page_end,
-        steps=steps,
+        steps=valid_steps,
         retrieval_text=retrieval_text,
-        embedding=embedding,
     )
     db.add(chunk)
     db.commit()
-    logger.debug(f"Flushed chunk for procedure '{proc_title}' pages {page_start}-{page_end}.")
+    
+    logger.debug(f"Flushed chunk '{proc_title}' pages {page_start}-{page_end} with {len(valid_steps)} steps.")
 
 
 # ── Main ingestion ─────────────────────────────────────────────────────────────
@@ -115,7 +94,6 @@ def process_pdf(file_path: str) -> str:
 
     doc_id = str(uuid.uuid4())
     filename = Path(file_path).name
-
     pdf = fitz.open(file_path)
     total_pages = len(pdf)
 
@@ -127,11 +105,9 @@ def process_pdf(file_path: str) -> str:
     )
     db.add(doc_row)
     db.commit()
-    logger.info(f"Ingesting '{filename}' ({total_pages} pages) as doc_id={doc_id}")
+    logger.info(f"Ingesting '{filename}' ({total_pages} pages) → doc_id={doc_id}")
 
-    lp_model = get_layout_model()
-
-    # State for semantic chunking
+    # Chunking state
     current_proc_id = str(uuid.uuid4())
     current_proc_title = "Introduction"
     current_proc_page_start = 1
@@ -143,16 +119,13 @@ def process_pdf(file_path: str) -> str:
         page = pdf[page_idx]
         page_num = page_idx + 1
 
-        # ── Skip truly blank pages ─────────────────────────────────────────────
-        if not page.get_text().strip() and not page.get_images(full=True):
-            logger.debug(f"Page {page_num}: blank — skipping.")
-            continue
-
-        # ── Render page to image ───────────────────────────────────────────────
+        # Render page image (for cropping)
         pix = page.get_pixmap(dpi=150)
         page_img_path = os.path.join(settings.pages_dir, f"page_{doc_id}_{page_num}.png")
         pix.save(page_img_path)
+        img_cv = cv2.imread(page_img_path)
 
+        # Store page row
         page_row = Page(
             id=str(uuid.uuid4()),
             document_id=doc_id,
@@ -162,79 +135,108 @@ def process_pdf(file_path: str) -> str:
         db.add(page_row)
         db.commit()
 
-        # ── Layout detection ───────────────────────────────────────────────────
-        img_cv = cv2.imread(page_img_path)
-        if img_cv is None:
-            logger.warning(f"Could not read rendered image for page {page_num}.")
-            continue
-
-        layout = lp_model.detect(img_cv)
-        # Sort top-to-bottom for reading order
-        blocks = sorted(layout, key=lambda b: b.coordinates[1])
+        # ── Extract text blocks via PyMuPDF ────────────────────────────────────
+        # dict mode gives us structured blocks with type info
+        page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        blocks = sorted(page_dict.get("blocks", []), key=lambda b: b.get("bbox", [0,0,0,0])[1])
 
         for block in blocks:
-            x1, y1, x2, y2 = [int(v) for v in block.coordinates]
-            block_type = block.type
+            btype = block.get("type", -1)
+            bbox = block.get("bbox", [0, 0, 0, 0])
 
-            crop = img_cv[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
+            if btype == 0:  # text block
+                # Gather all lines
+                text_lines = []
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        t = span.get("text", "").strip()
+                        if t:
+                            text_lines.append(t)
+                text = " ".join(text_lines).strip()
 
-            img_hash = _hash_image(crop)
+                if not text or len(text) < 4:
+                    continue
 
-            # ── OCR with cache ─────────────────────────────────────────────────
-            ocr_text = _get_cached_ocr(img_hash, db)
-            if ocr_text is None:
-                ocr_text = run_ocr(crop)
-                _cache_ocr(img_hash, ocr_text, db)
+                # Heuristic: large font or ALL-CAPS short line → title/header
+                first_span = block.get("lines", [{}])[0].get("spans", [{}])[0] if block.get("lines") else {}
+                font_size = first_span.get("size", 10)
+                is_header = font_size >= 13 or (len(text) < 80 and text.isupper())
 
-            # ── Handle each block type ─────────────────────────────────────────
-            if block_type == "Title":
-                # Flush current procedure chunk when a new title appears
-                if current_steps:
-                    _flush_chunk(
-                        doc_id, current_proc_id, current_proc_title,
-                        current_proc_page_start, page_num, current_steps, db
-                    )
-                    current_steps = []
-                    current_step_num = 1
+                if is_header:
+                    # Flush current procedure
+                    if current_steps:
+                        _flush_chunk(doc_id, current_proc_id, current_proc_title,
+                                     current_proc_page_start, page_num, current_steps, db)
+                        current_steps = []
+                        current_step_num = 1
 
-                current_proc_id = str(uuid.uuid4())
-                current_proc_title = ocr_text or f"Procedure (page {page_num})"
-                current_proc_page_start = page_num
-                logger.debug(f"New procedure: '{current_proc_title}'")
-
-            elif block_type in ("Text", "List"):
-                if len(ocr_text) > 8:
+                    current_proc_id = str(uuid.uuid4())
+                    current_proc_title = text[:200]
+                    current_proc_page_start = page_num
+                    logger.debug(f"Page {page_num}: New procedure: '{current_proc_title[:60]}'")
+                else:
+                    # Regular instruction text
                     current_steps.append({
                         "step": current_step_num,
-                        "instruction": ocr_text,
+                        "instruction": text,
                         "images": [],
                     })
                     current_step_num += 1
 
-            elif block_type in ("Figure", "Table"):
-                # Save crop to disk
+            elif btype == 1:  # image block
+                # Crop from rendered page image
+                x0, y0, x1, y1 = bbox
+                # Scale from PDF points to pixel coords (dpi=150, 72 pts/inch)
+                scale = 150 / 72
+                px0 = int(x0 * scale)
+                py0 = int(y0 * scale)
+                px1 = int(x1 * scale)
+                py1 = int(y1 * scale)
+
+                if img_cv is not None:
+                    h, w = img_cv.shape[:2]
+                    px0 = max(0, px0); py0 = max(0, py0)
+                    px1 = min(w, px1); py1 = min(h, py1)
+                    crop = img_cv[py0:py1, px0:px1]
+                else:
+                    crop = np.zeros((10, 10, 3), dtype=np.uint8)
+
+                if crop.size < 100:
+                    continue
+
+                img_hash = _hash_image(crop)
+
+                # OCR the image crop
+                ocr_text = _get_cached_ocr(img_hash, db)
+                if ocr_text is None:
+                    ocr_text = run_ocr(crop)
+                    _cache_ocr(img_hash, ocr_text, db)
+
+                # Save crop
                 crop_path = os.path.join(settings.crops_dir, f"{img_hash}.png")
                 if not os.path.exists(crop_path):
                     cv2.imwrite(crop_path, crop)
 
-                label = _figure_label(figure_counter)
+                label = f"Fig {figure_counter}"
                 figure_counter += 1
 
                 img_row = Image(
                     id=img_hash,
                     page_id=page_row.id,
                     page_number=page_num,
-                    bbox=[x1, y1, x2, y2],
+                    bbox=list(bbox),
                     path=crop_path,
                     figure_label=label,
                     caption=ocr_text,
                 )
-                db.add(img_row)
-                db.commit()
+                try:
+                    db.merge(img_row)
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.error(f"Failed to merge image {img_hash}: {e}")
 
-                # Attach image to last instruction step (or create orphan step)
+                # Attach image to last instruction step
                 if current_steps:
                     current_steps[-1]["images"].append(img_hash)
                 else:
@@ -245,16 +247,14 @@ def process_pdf(file_path: str) -> str:
                     })
                     current_step_num += 1
 
-        logger.info(f"Page {page_num}/{total_pages} processed.")
+        logger.info(f"Page {page_num}/{total_pages} done.")
 
-    # Flush final procedure chunk
+    # Flush final chunk
     if current_steps:
-        _flush_chunk(
-            doc_id, current_proc_id, current_proc_title,
-            current_proc_page_start, total_pages, current_steps, db
-        )
+        _flush_chunk(doc_id, current_proc_id, current_proc_title,
+                     current_proc_page_start, total_pages, current_steps, db)
 
     pdf.close()
     db.close()
-    logger.info(f"Ingestion complete for doc_id={doc_id}.")
+    logger.info(f"Ingestion complete → doc_id={doc_id}")
     return doc_id

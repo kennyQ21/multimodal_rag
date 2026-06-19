@@ -8,10 +8,12 @@ settings = get_settings()
 # Ensure model cache dirs are set in environment for HuggingFace libs
 os.environ.setdefault("HF_HOME", settings.hf_home)
 os.environ.setdefault("TRANSFORMERS_CACHE", settings.transformers_cache)
-os.environ.setdefault("EASYOCR_MODULE_PATH", settings.easyocr_module_path)
 
+
+connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(
     settings.database_url,
+    connect_args=connect_args,
     pool_pre_ping=True,
     pool_recycle=300,
 )

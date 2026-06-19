@@ -1,190 +1,316 @@
-from typing import List, Dict, Any, TypedDict
+"""
+LangGraph Workflow — Multimodal RAG
+
+Flow:
+    User Query
+    ↓ intent
+    ↓ query_expansion     (Groq LLM)
+    ↓ hybrid_retrieval    (BM25 + pgvector + RRF)
+    ↓ rerank              (bge-reranker-v2-m3)
+    ↓ neighbor_expansion  (pull sibling steps)
+    ↓ context_builder     (assemble text for Groq)
+    ↓ groq_generation     (Groq llama-3.3-70b — answer composition only)
+    ↓ citation_formatter  (attach images + citations)
+    ↓ END
+
+Groq is used ONLY for:
+    - Query expansion
+    - Answer composition / step ordering
+Groq does NOT do: OCR, chunking, retrieval, embeddings.
+"""
+import logging
+from typing import TypedDict, Annotated
+import operator
+
 from langgraph.graph import StateGraph, END
-from app.retrieval.search import get_bm25_scores, get_vector_scores, reciprocal_rank_fusion
-from app.retrieval.embeddings import get_embedding_model
-from app.reranker.model import get_reranker_model
-from app.storage.database import SessionLocal
-from app.storage.models import Chunk, Image as DBImage
 
-class GraphState(TypedDict):
+logger = logging.getLogger(__name__)
+
+
+# ── State ──────────────────────────────────────────────────────────────────────
+
+class RAGState(TypedDict):
     query: str
-    expanded_queries: List[str]
-    retrieved_ids: List[str]
-    steps: List[Dict[str, Any]]
-    citations: List[Dict[str, Any]]
-    final_response: Dict[str, Any]
+    expanded_queries: list[str]
+    retrieved_ids: list[str]            # chunk IDs from RRF
+    ranked_chunks: list[dict]           # after reranking
+    expanded_chunks: list[dict]         # after neighbor expansion
+    groq_answer: str                    # raw Groq prose answer
+    steps: list[dict]                   # final structured steps
+    citations: list[dict]
+    final_response: dict
 
-def intent_node(state: GraphState):
-    # Pass through or intent classification logic
+
+# ── Node 1: Intent (pass-through, extensible) ──────────────────────────────────
+
+def intent_node(state: RAGState) -> RAGState:
+    logger.debug("intent_node: pass-through")
     return state
 
-import os
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
 
-def query_expansion_node(state: GraphState):
+# ── Node 2: Query Expansion via Groq ──────────────────────────────────────────
+
+def query_expansion_node(state: RAGState) -> RAGState:
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import HumanMessage
+    from app.config import get_settings
+
+    settings = get_settings()
     query = state["query"]
-    api_key = os.getenv("GROQ_API_KEY", "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")
-    
+
     try:
-        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, groq_api_key=api_key)
-        prompt = f"Given the user query: '{query}', generate 2 alternative ways to ask this question for a retrieval system. Return ONLY the alternative queries, one per line."
+        llm = ChatGroq(
+            model=settings.groq_model,
+            temperature=0,
+            groq_api_key=settings.groq_api_key,
+        )
+        prompt = (
+            f"You are a technical document retrieval assistant.\n"
+            f"Original query: '{query}'\n"
+            f"Generate exactly 2 alternative phrasings of this query to improve document retrieval. "
+            f"Return ONLY the 2 alternatives, one per line, no numbering, no explanations."
+        )
         response = llm.invoke([HumanMessage(content=prompt)])
-        expanded = [line.strip() for line in response.content.split('\n') if line.strip()]
-        state["expanded_queries"] = [query] + expanded
+        extras = [l.strip() for l in response.content.strip().split("\n") if l.strip()][:2]
+        state["expanded_queries"] = [query] + extras
+        logger.debug(f"Expanded queries: {state['expanded_queries']}")
     except Exception as e:
-        print(f"LLM Error: {e}")
+        logger.warning(f"Query expansion failed: {e} — using original query only.")
         state["expanded_queries"] = [query]
-        
+
     return state
 
-def hybrid_retrieval_node(state: GraphState):
-    queries = state.get("expanded_queries", [state["query"]])
-    
-    all_bm25_results = []
-    all_vector_results = []
-    
-    embedder = get_embedding_model()
-    
-    for q in queries:
-        all_bm25_results.extend(get_bm25_scores(q, top_k=50))
-        query_emb = embedder.encode(q).tolist()
-        all_vector_results.extend(get_vector_scores(query_emb, top_k=30))
-    
-    # RRF
-    rrf_results = reciprocal_rank_fusion(all_bm25_results, all_vector_results, k=60, top_k=60)
-    
-    state["retrieved_ids"] = [chunk_id for chunk_id, score in rrf_results]
+
+# ── Node 3: Hybrid Retrieval ───────────────────────────────────────────────────
+
+def hybrid_retrieval_node(state: RAGState) -> RAGState:
+    from app.retrieval.search import hybrid_search
+
+    results = hybrid_search(
+        query=state["query"],
+        queries=state.get("expanded_queries"),
+    )
+    state["retrieved_ids"] = [chunk_id for chunk_id, _ in results]
+    logger.debug(f"Hybrid retrieval: {len(state['retrieved_ids'])} candidates.")
     return state
 
-def rerank_node(state: GraphState):
-    query = state["query"]
-    retrieved_ids = state["retrieved_ids"]
-    
-    if not retrieved_ids:
+
+
+
+# ── Node 5: Neighbor Expansion ─────────────────────────────────────────────────
+
+def neighbor_expansion_node(state: RAGState) -> RAGState:
+    """
+    For each top-ranked chunk, fetch ALL chunks in the same procedure
+    so the full step sequence is available — never partial procedures.
+    """
+    from app.storage.database import SessionLocal
+    from app.storage.models import Chunk
+
+    ids = state.get("retrieved_ids", [])
+    if not ids:
+        state["expanded_chunks"] = []
         return state
-        
-    db = SessionLocal()
-    chunks = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids)).all()
-    chunk_map = {c.id: c for c in chunks}
-    db.close()
-    
-    pairs = []
-    valid_ids = []
-    for cid in retrieved_ids:
-        if cid in chunk_map:
-            pairs.append([query, chunk_map[cid].retrieval_text])
-            valid_ids.append(cid)
-            
-    reranker = get_reranker_model()
-    scores = reranker.compute_score(pairs)
-    
-    # Sort by score descending
-    scored_ids = sorted(zip(valid_ids, scores), key=lambda x: x[1], reverse=True)
-    
-    # Top 8
-    final_top_8 = [cid for cid, score in scored_ids[:8]]
-    state["retrieved_ids"] = final_top_8
-    return state
 
-def neighbor_expansion_node(state: GraphState):
-    # For the top chunks, we might want to get the whole procedure or just pass them forward.
-    # The spec says "Ordered Steps", so we order them by procedure_id and step_number, or just page_number.
     db = SessionLocal()
-    retrieved_ids = state["retrieved_ids"]
-    if not retrieved_ids:
+    try:
+        # We simulate "ranked" by fetching the top 8 (rerank_top_k) from retrieved_ids directly
+        from app.config import get_settings
+        settings = get_settings()
+        top_ids = ids[:settings.rerank_top_k]
+        
+        rows = db.query(Chunk).filter(Chunk.id.in_(top_ids)).all()
+        ranked = [
+            {"chunk_id": r.id, "retrieval_text": r.retrieval_text or "",
+             "steps": r.steps, "page_start": r.page_start,
+             "page_end": r.page_end, "procedure_title": r.procedure_title,
+             "procedure_id": r.procedure_id}
+            for r in rows
+        ]
+        
+        proc_ids = list({c["procedure_id"] for c in ranked if c.get("procedure_id")})
+
+        rows = (
+            db.query(Chunk)
+            .filter(Chunk.procedure_id.in_(proc_ids))
+            .order_by(Chunk.page_start)
+            .all()
+        )
+        state["expanded_chunks"] = [
+            {"chunk_id": r.id, "retrieval_text": r.retrieval_text or "",
+             "steps": r.steps, "page_start": r.page_start,
+             "page_end": r.page_end, "procedure_title": r.procedure_title,
+             "procedure_id": r.procedure_id}
+            for r in rows
+        ]
+    finally:
         db.close()
-        return state
-        
-    chunks = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids)).all()
-    
-    # Group by procedure to return coherent steps
-    procedures = set([c.procedure_id for c in chunks])
-    
-    # For now, let's just fetch all chunks for the top 1 or 2 procedures matched
-    # to ensure complete step-by-step instructions.
-    expanded_chunks = db.query(Chunk).filter(Chunk.procedure_id.in_(procedures)).order_by(Chunk.page_start).all()
-    
-    state["retrieved_ids"] = [c.id for c in expanded_chunks]
-    db.close()
+
+    logger.debug(f"Neighbor expansion: {len(state['expanded_chunks'])} total chunks.")
     return state
 
-def step_composer_node(state: GraphState):
-    db = SessionLocal()
-    retrieved_ids = state["retrieved_ids"]
-    chunks = db.query(Chunk).filter(Chunk.id.in_(retrieved_ids)).all()
-    
-    # Sort chunks by page/procedure
-    chunks.sort(key=lambda x: x.page_start)
-    
-    steps = []
-    citations = []
+
+# ── Node 6: Context Builder ────────────────────────────────────────────────────
+
+def context_builder_node(state: RAGState) -> RAGState:
+    """
+    Assemble a structured text context from expanded chunks
+    to feed to Groq for answer composition.
+    """
+    chunks = state.get("expanded_chunks", [])
+    lines = []
     for chunk in chunks:
-        for step in chunk.steps:
-            steps.append({
-                "instruction": step["instruction"],
-                "images": step["images"],
-                "chunk_id": chunk.id,
-                "page": chunk.page_start
-            })
-            for img_hash in step["images"]:
-                citations.append({
-                    "page": chunk.page_start,
-                    "chunk_id": chunk.id,
-                    "image_id": img_hash
-                })
-    
-    state["steps"] = steps
-    state["citations"] = citations
-    db.close()
+        title = chunk.get("procedure_title", "")
+        lines.append(f"\n### {title}")
+        for step in chunk.get("steps", []):
+            step_num = step.get("step", "?")
+            instruction = step.get("instruction", "")
+            if instruction:
+                lines.append(f"Step {step_num}: {instruction}")
+
+    state["groq_answer"] = "\n".join(lines)   # will be replaced by Groq
     return state
 
-def citation_formatter_node(state: GraphState):
-    db = SessionLocal()
-    citations = state["citations"]
-    steps = state["steps"]
-    
-    formatted_steps = []
-    for step in steps:
-        step_imgs = []
-        for img_id in step["images"]:
-            img_record = db.query(DBImage).filter(DBImage.id == img_id).first()
-            if img_record:
-                step_imgs.append({
-                    "path": img_record.path,
-                    "citation": f"Source: Page {img_record.page.page_number} \u00b7 Figure" if img_record.page else f"Source: Page {step['page']}"
-                })
-        
-        formatted_steps.append({
-            "instruction": step["instruction"],
-            "images": step_imgs
-        })
-        
-    state["final_response"] = {
-        "steps": formatted_steps,
-        "citations": citations
-    }
-    db.close()
+
+# ── Node 7: Groq Generation ────────────────────────────────────────────────────
+
+def groq_generation_node(state: RAGState) -> RAGState:
+    """
+    Groq receives the retrieved context and the user query.
+    Groq ONLY does:
+        - Procedure formatting / ordering
+        - Answer composition using ONLY retrieved content
+    Groq does NOT hallucinate steps — it must cite only what is in context.
+    """
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from app.config import get_settings
+
+    settings = get_settings()
+    context = state.get("groq_answer", "")
+    query = state["query"]
+
+    if not context.strip():
+        state["groq_answer"] = "No relevant steps found in the manual."
+        return state
+
+    system_prompt = (
+        "You are a technical manual assistant. "
+        "You will be given extracted steps from a technical manual and a user question. "
+        "Your job is to select and format ONLY the steps relevant to the question, "
+        "preserving their exact order from the manual. "
+        "Do NOT add, invent, or paraphrase steps — only use what is provided. "
+        "Format as numbered steps. If a step has associated images, note [See figure]. "
+        "Be concise and precise."
+    )
+    user_prompt = (
+        f"User question: {query}\n\n"
+        f"Extracted manual content:\n{context}\n\n"
+        "Please provide the relevant how-to steps in order."
+    )
+
+    try:
+        llm = ChatGroq(
+            model=settings.groq_model,
+            temperature=0,
+            groq_api_key=settings.groq_api_key,
+            max_tokens=2048,
+        )
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        state["groq_answer"] = response.content.strip()
+        logger.debug("Groq generation complete.")
+    except Exception as e:
+        logger.error(f"Groq generation failed: {e}")
+        # Fall back to raw extracted context if Groq fails
+        state["groq_answer"] = context
+
     return state
+
+
+# ── Node 8: Citation Formatter ─────────────────────────────────────────────────
+
+def citation_formatter_node(state: RAGState) -> RAGState:
+    """
+    Build the final structured response with steps, images, and citations.
+    """
+    from app.storage.database import SessionLocal
+    from app.storage.models import Image
+
+    db = SessionLocal()
+    try:
+        chunks = state.get("expanded_chunks", [])
+        formatted_steps = []
+        citations = []
+
+        for chunk in chunks:
+            for step in chunk.get("steps", []):
+                instruction = step.get("instruction", "")
+                step_images = []
+
+                for img_id in step.get("images", []):
+                    img_row = db.query(Image).filter(Image.id == img_id).first()
+                    if img_row:
+                        step_images.append({
+                            "image_id": img_id,
+                            "path": img_row.path,
+                            "figure_label": img_row.figure_label or "",
+                            "caption": img_row.caption or "",
+                            "citation": f"Source: Page {img_row.page_number} · {img_row.figure_label or 'Figure'}",
+                        })
+                        citations.append({
+                            "page": img_row.page_number,
+                            "figure": img_row.figure_label or "",
+                            "chunk_id": chunk["chunk_id"],
+                            "image_id": img_id,
+                        })
+
+                if instruction or step_images:
+                    formatted_steps.append({
+                        "step": step.get("step"),
+                        "instruction": instruction,
+                        "images": step_images,
+                        "page": chunk["page_start"],
+                        "procedure": chunk.get("procedure_title", ""),
+                    })
+
+        state["steps"] = formatted_steps
+        state["citations"] = citations
+        state["final_response"] = {
+            "query": state["query"],
+            "answer": state.get("groq_answer", ""),
+            "steps": formatted_steps,
+            "citations": citations,
+            "total_steps": len(formatted_steps),
+        }
+    finally:
+        db.close()
+
+    return state
+
+
+# ── Build Graph ────────────────────────────────────────────────────────────────
 
 def build_graph():
-    workflow = StateGraph(GraphState)
-    
+    workflow = StateGraph(RAGState)
+
     workflow.add_node("intent", intent_node)
     workflow.add_node("query_expansion", query_expansion_node)
     workflow.add_node("hybrid_retrieval", hybrid_retrieval_node)
-    workflow.add_node("rerank", rerank_node)
     workflow.add_node("neighbor_expansion", neighbor_expansion_node)
-    workflow.add_node("step_composer", step_composer_node)
+    workflow.add_node("context_builder", context_builder_node)
+    workflow.add_node("groq_generation", groq_generation_node)
     workflow.add_node("citation_formatter", citation_formatter_node)
-    
+
     workflow.set_entry_point("intent")
     workflow.add_edge("intent", "query_expansion")
     workflow.add_edge("query_expansion", "hybrid_retrieval")
-    workflow.add_edge("hybrid_retrieval", "rerank")
-    workflow.add_edge("rerank", "neighbor_expansion")
-    workflow.add_edge("neighbor_expansion", "step_composer")
-    workflow.add_edge("step_composer", "citation_formatter")
+    workflow.add_edge("hybrid_retrieval", "neighbor_expansion")
+    workflow.add_edge("neighbor_expansion", "context_builder")
+    workflow.add_edge("context_builder", "groq_generation")
+    workflow.add_edge("groq_generation", "citation_formatter")
     workflow.add_edge("citation_formatter", END)
-    
+
     return workflow.compile()
