@@ -55,6 +55,12 @@ def _is_tesseract_available() -> bool:
     if _tesseract_available is None:
         try:
             import pytesseract
+            
+            tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            import os
+            if os.path.exists(tesseract_path):
+                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
             pytesseract.get_tesseract_version()
             _tesseract_available = True
         except Exception:

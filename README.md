@@ -4,38 +4,80 @@ A multimodal Retrieval-Augmented Generation (RAG) system built to answer how-to 
 
 ## Key Features
 * **Illustrated Steps**: Interleaves extracted text instructions with exact matching screenshots from the manual.
-* **Hybrid Retrieval**: Combines BM25 and Vector Search (ChromaDB + BGE Large) with Reciprocal Rank Fusion (RRF).
-* **Cross-Encoder Reranking**: Uses `bge-reranker-v2-m3` to sort and identify the most relevant procedure chunks.
-* **Neighbor Expansion**: Automatically pulls surrounding steps of a top-ranked procedure to ensure completeness and avoid partial answers.
+* **Hybrid Retrieval**: Relies on Okapi BM25 and SQLite to bypass heavy vector database constraints and ensure maximum local environment compatibility.
 * **Source Grounding**: Every instruction and image is strictly tied to a specific page and figure label.
-* **Local Parsing**: Uses PyMuPDF + PaddleOCR for CPU-optimized layout detection and text extraction from screenshots/figures.
+* **Local Parsing**: Uses PyMuPDF for layout detection and PaddleOCR for local, CPU-optimized text extraction from screenshots/figures.
 * **Groq Generation**: Uses `llama-3.3-70b-versatile` exclusively for answer composition and formatting (zero-hallucination instruction selection).
 
-## Architecture & Tradeoffs
-* **Vector Store / DB**: Uses pure SQLite for storing extracted chunks and image metadata, removing the need for heavy external vector databases or Docker.
-* **Retrieval (BM25)**: Relies exclusively on local `rank_bm25` (Okapi BM25) for high-precision text retrieval, bypassing the severe Windows DLL compatibility issues caused by PyTorch/ONNX on Python 3.12.
-* **Parsing (PyMuPDF + PaddleOCR)**: Uses PyMuPDF for layout detection and text extraction from screenshots/figures. PaddleOCR is retained for robust, high-accuracy text extraction from crops.
-* **Unanswerable Questions**: The LLM evaluates retrieved chunks and if it cannot confidently format steps using only the provided context, the system cleanly reports it cannot answer the query.
+---
 
-## Evaluation
-**Metrics implemented:**
-1. **Step Completeness & Ordering**: The final generated output is compared against the source manual for sequence integrity.
-2. **Image-Step Pairing**: Measures if the assigned image accurately matches the instruction context.
-3. **Grounding Verification**: All steps must map directly to an explicit page and figure number citation.
+## 🏗️ Detailed Architecture
 
-*To evaluate more systematically, I would run semantic similarity (e.g., using RAGAS) on generated text against a gold-standard annotated manual dataset.*
+This application operates entirely locally (except for the LLM generation) using lightweight components designed for Windows compatibility without relying on Docker or complex GPU frameworks.
 
-## Quickstart
+### 1. Ingestion Pipeline (`run_ingestion.py`)
+* **Document Parsing (PyMuPDF)**: Reads the technical manual (`Dataset.pdf`), detects page dimensions, and strictly crops the visual contents. Each page is converted to an image and saved locally in `data/crops/`.
+* **Text Extraction (PaddleOCR)**: Extracts raw text directly from the cropped images. To bypass severe Windows DLL dependency errors on modern Python versions (e.g. 3.12/3.13), it utilizes a specialized `sitecustomize.py` DLL loading fix and a stable CPU build of `paddlepaddle`.
+* **Storage (SQLite)**: Saves the page metadata (page number, image path, OCR text) in a local relational database (`multimodal_rag.db`).
 
-1. **Install Dependencies (Python 3.12 Recommended)**:
-```bash
-python -m venv .venv
+### 2. Retrieval & RAG Pipeline (`app/query/pipeline.py`)
+* **Lexical Search (BM25)**: Because local PyTorch and ONNX models can crash unpredictably on Windows environments missing C++ dependencies, we strictly use `rank_bm25`. This retrieves the most textually relevant pages based on the user's query.
+* **LangGraph Orchestration**: The AI workflow is managed by LangGraph. It compiles the retrieved text and passes it to Groq API.
+* **Answer Composition (Groq)**: The LLM reads the retrieved text and structures a step-by-step guide. It is strictly prompted to **only** use the provided context. If the query cannot be answered using the extracted manual text, the LLM safely replies: *"There are no steps provided."*
+
+---
+
+## 🚀 Setup and Start Guide (Windows + CPU)
+
+The project relies on a very specific setup to guarantee stable local execution on Windows laptops, bypassing common PaddleOCR DLL loading failures.
+
+### 1. Create a Clean Virtual Environment
+
+Open **PowerShell** and initialize the project:
+
+```powershell
+# Clone the repository
+git clone https://github.com/kennyQ21/multimodal_rag.git
+cd multimodal_rag
+
+# Create a clean Python 3.12 environment
+py -3.12 -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Upgrade base tooling
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-2. **Configure Environment**:
+### 2. Install PaddlePaddle (CPU)
+
+Install the CPU build **first** using the stable Chinese mirror to prevent dependency conflicts:
+
+```powershell
+python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+```
+
+Verify the installation:
+```powershell
+python -c "import paddle; print(paddle.__version__)"
+# Expected output: 3.2.0
+```
+
+### 3. Install PaddleOCR and Requirements
+
+```powershell
+# Install PaddleOCR standalone (avoids heavy optional features)
+python -m pip install paddleocr
+
+# Install remaining dependencies
+pip install -r requirements.txt
+```
+
+### 4. Ensure Windows DLL Loading Fix is Active
+
+The repository includes a `sitecustomize.py` file in the root. Python automatically imports this at startup on Windows to force the environment to properly discover `libpaddle.pyd` C++ dependencies. **Do not delete this file.**
+
+### 5. Configure Environment Variables
+
 Create a `.env` file in the root directory:
 ```env
 GROQ_API_KEY=your_groq_api_key
@@ -43,26 +85,29 @@ GROQ_MODEL=llama-3.3-70b-versatile
 DATABASE_URL=sqlite:///./multimodal_rag.db
 ```
 
-3. **Run Ingestion**:
-Provide the `Dataset.pdf` (e.g., PT-LT100 Leak Testing Instrument manual) in the root.
-```bash
+### 6. Cache Weights and Run Ingestion
+
+Place `Dataset.pdf` in the root folder, then run the ingestion pipeline. On the first run, PaddleOCR will download and cache the necessary inference weights.
+
+```powershell
 python run_ingestion.py
 ```
-*(This extracts text, crops images, runs OCR, generates embeddings, and saves to ChromaDB & SQLite).*
+*(This will populate `data/crops/` with images and build `multimodal_rag.db`).*
 
-4. **Query the System**:
-```bash
+### 7. Start the Application / Query
+
+To query the terminal directly:
+```powershell
 python scripts/test_query.py
 ```
-Or start the FastAPI server:
-```bash
+
+To start the FastAPI server:
+```powershell
 python run.py
 ```
 
-## Sample Questions Answered
-* **Routine operation**: "How do I run a leak test on a blister pack, step by step?"
-* **Calibration**: "How do I calibrate the vacuum function on the PT-LT100?"
-* **Accessory setup**: "How do I connect an external balance and weigh the sample before/after a test?"
-* **Maintenance**: "How do I replace the vacuum pump filter?"
-* **Configuration**: "How do I set up user access control / log in as a user?"
-* **Unanswerable**: "How do I update the instrument firmware over WI-FI?" (Will cleanly reject).
+---
+
+## 🧪 Evaluation
+
+System metrics, architectural tradeoffs, and testing outcomes have been extensively documented in `evaluation.md`.
