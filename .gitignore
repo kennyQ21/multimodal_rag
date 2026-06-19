@@ -7,3 +7,4 @@ multimodal_rag.db
 *.log
 models/
 .pytest_cache/
+mingit/

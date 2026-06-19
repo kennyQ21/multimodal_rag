@@ -135,124 +135,45 @@ def process_pdf(file_path: str) -> str:
         db.add(page_row)
         db.commit()
 
-        # ── Extract text blocks via PyMuPDF ────────────────────────────────────
-        # dict mode gives us structured blocks with type info
-        page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-        blocks = sorted(page_dict.get("blocks", []), key=lambda b: b.get("bbox", [0,0,0,0])[1])
+        # OCR the full page
+        ocr_text = run_ocr(img_cv)
+        
+        # Save crop of the whole page as a fallback image if no other images exist
+        img_hash = _hash_image(img_cv)
+        crop_path = os.path.join(settings.crops_dir, f"{img_hash}.png")
+        if not os.path.exists(crop_path):
+            cv2.imwrite(crop_path, img_cv)
 
-        for block in blocks:
-            btype = block.get("type", -1)
-            bbox = block.get("bbox", [0, 0, 0, 0])
+        img_row = Image(
+            id=img_hash,
+            page_id=page_row.id,
+            page_number=page_num,
+            bbox=[0, 0, img_cv.shape[1], img_cv.shape[0]],
+            path=crop_path,
+            figure_label=f"Page {page_num}",
+            caption=ocr_text[:200],
+        )
+        try:
+            db.merge(img_row)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to merge image {img_hash}: {e}")
 
-            if btype == 0:  # text block
-                # Gather all lines
-                text_lines = []
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        t = span.get("text", "").strip()
-                        if t:
-                            text_lines.append(t)
-                text = " ".join(text_lines).strip()
-
-                if not text or len(text) < 4:
-                    continue
-
-                # Heuristic: large font or ALL-CAPS short line → title/header
-                first_span = block.get("lines", [{}])[0].get("spans", [{}])[0] if block.get("lines") else {}
-                font_size = first_span.get("size", 10)
-                is_header = font_size >= 13 or (len(text) < 80 and text.isupper())
-
-                if is_header:
-                    # Flush current procedure
-                    if current_steps:
-                        _flush_chunk(doc_id, current_proc_id, current_proc_title,
-                                     current_proc_page_start, page_num, current_steps, db)
-                        current_steps = []
-                        current_step_num = 1
-
-                    current_proc_id = str(uuid.uuid4())
-                    current_proc_title = text[:200]
-                    current_proc_page_start = page_num
-                    logger.debug(f"Page {page_num}: New procedure: '{current_proc_title[:60]}'")
-                else:
-                    # Regular instruction text
-                    current_steps.append({
-                        "step": current_step_num,
-                        "instruction": text,
-                        "images": [],
-                    })
-                    current_step_num += 1
-
-            elif btype == 1:  # image block
-                # Crop from rendered page image
-                x0, y0, x1, y1 = bbox
-                # Scale from PDF points to pixel coords (dpi=150, 72 pts/inch)
-                scale = 150 / 72
-                px0 = int(x0 * scale)
-                py0 = int(y0 * scale)
-                px1 = int(x1 * scale)
-                py1 = int(y1 * scale)
-
-                if img_cv is not None:
-                    h, w = img_cv.shape[:2]
-                    px0 = max(0, px0); py0 = max(0, py0)
-                    px1 = min(w, px1); py1 = min(h, py1)
-                    crop = img_cv[py0:py1, px0:px1]
-                else:
-                    crop = np.zeros((10, 10, 3), dtype=np.uint8)
-
-                if crop.size < 100:
-                    continue
-
-                img_hash = _hash_image(crop)
-
-                # OCR the image crop
-                ocr_text = _get_cached_ocr(img_hash, db)
-                if ocr_text is None:
-                    ocr_text = run_ocr(crop)
-                    _cache_ocr(img_hash, ocr_text, db)
-
-                # Save crop
-                crop_path = os.path.join(settings.crops_dir, f"{img_hash}.png")
-                if not os.path.exists(crop_path):
-                    cv2.imwrite(crop_path, crop)
-
-                label = f"Fig {figure_counter}"
-                figure_counter += 1
-
-                img_row = Image(
-                    id=img_hash,
-                    page_id=page_row.id,
-                    page_number=page_num,
-                    bbox=list(bbox),
-                    path=crop_path,
-                    figure_label=label,
-                    caption=ocr_text,
-                )
-                try:
-                    db.merge(img_row)
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    logger.error(f"Failed to merge image {img_hash}: {e}")
-
-                # Attach image to last instruction step
-                if current_steps:
-                    current_steps[-1]["images"].append(img_hash)
-                else:
-                    current_steps.append({
-                        "step": current_step_num,
-                        "instruction": "",
-                        "images": [img_hash],
-                    })
-                    current_step_num += 1
-
+        # Treat each page as a separate procedure/chunk
+        step = {
+            "step": 1,
+            "instruction": ocr_text,
+            "images": [img_hash]
+        }
+        
+        proc_id = str(uuid.uuid4())
+        proc_title = f"Page {page_num} Procedures"
+        
+        _flush_chunk(doc_id, proc_id, proc_title, page_num, page_num, [step], db)
         logger.info(f"Page {page_num}/{total_pages} done.")
 
-    # Flush final chunk
-    if current_steps:
-        _flush_chunk(doc_id, current_proc_id, current_proc_title,
-                     current_proc_page_start, total_pages, current_steps, db)
+
 
     pdf.close()
     db.close()
