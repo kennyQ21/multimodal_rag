@@ -1,0 +1,45 @@
+# Core API
+fastapi
+uvicorn[standard]
+pydantic>=2.0,<3.0
+pydantic-settings
+python-multipart
+
+# Database
+sqlalchemy
+psycopg2-binary
+pgvector
+
+# LangGraph / LangChain
+langgraph
+langchain-core
+langchain-groq
+
+# Retrieval
+rank-bm25
+numpy
+
+# PDF Processing
+PyMuPDF
+
+# OCR — Primary
+paddlepaddle==3.0.0
+paddleocr==2.9.1
+
+# OCR — Fallback
+pytesseract
+Pillow
+
+# Layout Detection
+layoutparser[paddledetection]
+
+# Image processing
+opencv-python-headless
+
+# Embeddings and Reranker
+sentence-transformers
+FlagEmbedding
+
+# Utilities
+httpx
+python-dotenv
